@@ -8,11 +8,20 @@ const RESOLVERS = [
   { id: 'google', name: 'Google Public DNS', short: 'Google', url: 'https://dns.google/resolve' },
   { id: 'cloudflare', name: 'Cloudflare DNS', short: 'Cloudflare', url: 'https://cloudflare-dns.com/dns-query' },
 ];
-function validDomain(value) {
-  if (typeof value !== 'string') return false;
-  const d = value.trim().toLowerCase().replace(/\.$/, '');
-  if (d.length < 3 || d.length > 253 || !d.includes('.') || /^\d+(\.\d+){3}$/.test(d)) return false;
-  return d.split('.').every(label => label.length > 0 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)) && /^[a-z]{2,63}$/.test(d.split('.').at(-1));
+function normalizeDomain(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  let parsed;
+  try {
+    const raw = value.trim();
+    parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : 'https://' + raw);
+  } catch (_) { return null; }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return null;
+  const domain = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  if (domain.length < 3 || domain.length > 253 || !domain.includes('.') || /^\d+(\.\d+){3}$/.test(domain)) return null;
+  const labels = domain.split('.');
+  if (!labels.every(label => label.length > 0 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label))) return null;
+  if (!/^[a-z]{2,63}$/.test(labels.at(-1))) return null;
+  return domain;
 }
 async function queryResolver(resolver, domain, type) {
   const url = new URL(resolver.url);
@@ -33,14 +42,24 @@ module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store, max-age=0');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); return res.status(405).json({ error: 'Use POST for DNS scans.' }); }
-  const domain = typeof req.body?.domain === 'string' ? req.body.domain.trim().toLowerCase().replace(/\.$/, '') : '';
-  if (!validDomain(domain)) return res.status(400).json({ error: 'Enter a valid public domain name.' });
+  const domain = normalizeDomain(req.body?.domain);
+  if (!domain) return res.status(400).json({ error: 'Enter a valid website URL or domain name, for example https://example.com.' });
   try {
     const pairs = await Promise.all(RESOLVERS.flatMap(r => TYPES.map(async t => {
       const key = r.id + '|' + t.name;
       try { return [key, await queryResolver(r, domain, t)]; }
       catch (error) { return [key, { ok: false, error: error.name === 'TimeoutError' || error.name === 'AbortError' ? 'Request timed out' : error.message, resolver: r.short, queryType: t.code }]; }
     })));
-    return res.status(200).json({ domain, scannedAt: new Date().toISOString(), engine: 'DNSGuard server-side DNS-over-HTTPS API', results: Object.fromEntries(pairs) });
+    const results = Object.fromEntries(pairs);
+    const allResolversConfirmNxDomain = RESOLVERS.every(r =>
+      ['A', 'AAAA'].every(type => results[r.id + '|' + type]?.ok && results[r.id + '|' + type].status === 3)
+    );
+    if (allResolversConfirmNxDomain) {
+      return res.status(422).json({
+        code: 'DOMAIN_NOT_FOUND',
+        error: 'Both public DNS resolvers report that this domain does not exist (NXDOMAIN). The website address may be misspelled or unregistered.'
+      });
+    }
+    return res.status(200).json({ domain, scannedAt: new Date().toISOString(), engine: 'DNSGuard server-side DNS-over-HTTPS API', results });
   } catch (_) { return res.status(502).json({ error: 'DNS scan service could not complete the request.' }); }
 };
